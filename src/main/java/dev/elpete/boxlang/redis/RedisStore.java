@@ -21,13 +21,16 @@ import redis.clients.jedis.resps.ScanResult;
 public final class RedisStore extends AbstractStore {
     private static final String WRITE = """
         if ARGV[5]=='nx' and redis.call('exists',KEYS[1])==1 then return 0 end
+        local current=redis.call('hget',KEYS[1],'generation')
+        if ARGV[6]~='' and current~=ARGV[6] then return 0 end
+        local generation=ARGV[6]~='' and current or ARGV[7]
         local t=redis.call('time'); local now=t[1]*1000+math.floor(t[2]/1000)
         local absolute=tonumber(ARGV[3]); local idle=tonumber(ARGV[4]); local ttl=absolute
         if ttl==0 or (idle>0 and idle<ttl) then ttl=idle end
         local deadline=0; if absolute>0 then deadline=now+absolute end
-        redis.call('hset',KEYS[1],'payload',ARGV[1],'name',ARGV[2],'deadline',deadline,'absolute',absolute,'idle',idle,'hits',0)
+        redis.call('hset',KEYS[1],'payload',ARGV[1],'name',ARGV[2],'deadline',deadline,'absolute',absolute,'idle',idle,'hits',0,'generation',generation)
         if ttl>0 then redis.call('pexpire',KEYS[1],ttl) else redis.call('persist',KEYS[1]) end
-        return 1
+        return generation
         """;
     private static final String READ = """
         local payload=redis.call('hget',KEYS[1],'payload'); if not payload then return {} end
@@ -53,7 +56,11 @@ public final class RedisStore extends AbstractStore {
             elseif deadline>0 then redis.call('del',KEYS[1]); return {} end
           end
         end
-        return {payload,tostring(hits)}
+        local generation=redis.call('hget',KEYS[1],'generation')
+        if not generation then
+          generation=ARGV[3]; redis.call('hset',KEYS[1],'generation',generation)
+        end
+        return {payload,tostring(hits),generation}
         """;
     private UnifiedJedis client;
     private String prefix;
@@ -91,18 +98,27 @@ public final class RedisStore extends AbstractStore {
     }
 
     public boolean write(Key key, ICacheEntry entry, boolean onlyAbsent) {
+        return writeVersioned(key, entry, onlyAbsent, null) != null;
+    }
+
+    /** A session snapshot may update only the generation it actually read. */
+    public String writeVersioned(Key key, ICacheEntry entry, boolean onlyAbsent, String expectedGeneration) {
         long absolute = Math.multiplyExact(entry.timeout(), 1000L);
         long idle = Connections.flag(config, "useLastAccessTimeouts", true)
             ? Math.multiplyExact(entry.lastAccessTimeout(), 1000L) : 0;
         if (absolute < 0 || idle < 0) { throw new IllegalArgumentException("Cache timeouts cannot be negative"); }
-        return ((Number)client.eval(WRITE, List.of(redisKey(key)), List.of(serialize(entry), key.getName(),
-            Long.toString(absolute), Long.toString(idle), onlyAbsent ? "nx" : "set"))).longValue() == 1;
+        Object result = client.eval(WRITE, List.of(redisKey(key)), List.of(serialize(entry), key.getName(),
+            Long.toString(absolute), Long.toString(idle), onlyAbsent ? "nx" : "set",
+            expectedGeneration == null ? "" : expectedGeneration, UUID.randomUUID().toString()));
+        return result instanceof String generation ? generation : null;
     }
 
-    private ICacheEntry read(Key key, boolean touch) {
+    public record VersionedEntry(ICacheEntry entry, String generation) {}
+
+    public VersionedEntry readVersioned(Key key, boolean touch) {
         boolean reset = Connections.flag(config, "resetTimeoutOnAccess", false);
         List<?> result = (List<?>)client.eval(READ, List.of(redisKey(key)),
-            List.of(touch ? "touch" : "quiet", reset ? "reset" : "fixed"));
+            List.of(touch ? "touch" : "quiet", reset ? "reset" : "fixed", UUID.randomUUID().toString()));
         if (result.isEmpty()) { return null; }
         Object decoded = ObjectMarshaller.deserialize(context(), Base64.getDecoder().decode((String)result.getFirst()));
         if (!(decoded instanceof ICacheEntry entry)) { throw new IllegalStateException("Invalid Redis cache entry type"); }
@@ -111,7 +127,12 @@ public final class RedisStore extends AbstractStore {
         if (entry instanceof ortus.boxlang.runtime.cache.BoxCacheEntry concrete) {
             concrete.setHits(Long.parseLong((String)result.get(1)));
         }
-        return entry;
+        return new VersionedEntry(entry, (String)result.get(2));
+    }
+
+    private ICacheEntry read(Key key, boolean touch) {
+        VersionedEntry observed = readVersioned(key, touch);
+        return observed == null ? null : observed.entry();
     }
 
     private Set<String> names() {

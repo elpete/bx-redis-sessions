@@ -72,7 +72,7 @@ BOXLANG_JAR=/absolute/path/to/boxlang.jar REDIS_TEST_PORT=6379 node scripts/buil
 ```
 
 The build runs the complete suite, then creates
-`target/bx-redis-sessions-0.1.0.zip`. Extract it into a directory named
+`target/bx-redis-sessions-0.1.1.zip`. Extract it into a directory named
 `bx-redis-sessions` under the runtime's `modules` directory. Neither the build nor
 the tests install into an existing server.
 
@@ -105,13 +105,22 @@ may run more than once, but return the winning published value. Do not put exter
 side effects in a cache value producer.
 
 This preserves native BoxLang session semantics. Concurrent requests can load
-separate snapshots and later writes can replace earlier snapshots. The provider
-does not promise field merging or transactionally ordered login/logout across
-overlapping requests. Authentication behavior under those conditions needs
-application-level verification before a CommuniArts cutover.
+separate snapshots and later writes can replace earlier snapshots. A session
+snapshot carries the Redis generation it read. Writeback atomically
+requires that same generation still exist, so a snapshot cannot recreate a cleared
+or expired session, or overwrite an anonymous replacement with the same ID. Reads
+and ordinary same-generation writes remain nonexclusive and last-writer-wins;
+there is no field merging or browser-wide request lease.
+
+All participating processes, including warm rollback images, must use 0.1.1 or
+newer. An older writer can bypass this guard; mixed-version operation is unsafe.
+Existing entries acquire a generation atomically when read. Readiness can verify
+`getSessionWritebackProtocol()` returns `generation-v1`.
 
 Verified locally: native session object round-trip, separate JVMs sharing a session,
 rotation and invalidation with the runtime correction, expiration, namespace
 isolation, atomic cache initialization, and parallel reads with a held consumer.
-Managed-provider TLS, browser/cookie flows, and CommuniArts integration remain
-unverified. This module has not been deployed.
+Seven local CommuniArts HTTP checks also pass, including cross-process login,
+logout, old-cookie replay with an overlapping request, tenant-origin CSRF and idle
+expiry. Managed-provider TLS, hardware capacity and the final pinned application
+image remain unverified. This module has not been deployed to production.

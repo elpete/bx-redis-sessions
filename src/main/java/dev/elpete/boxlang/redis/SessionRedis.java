@@ -1,6 +1,11 @@
 package dev.elpete.boxlang.redis;
 
 import java.time.Duration;
+import java.util.Collections;
+import java.util.Locale;
+import java.util.Map;
+import java.util.WeakHashMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
 import java.util.stream.Stream;
 import ortus.boxlang.runtime.cache.*;
@@ -19,10 +24,29 @@ import redis.clients.jedis.*;
 /** Native BoxLang provider. There is deliberately no request/session lease. */
 public final class SessionRedis extends AbstractCacheProvider {
     protected RedisStore store;
+    /** Readiness admission must exclude writers that can resurrect revoked snapshots. */
+    public String getSessionWritebackProtocol() { return "generation-v1"; }
+    // Keys are weak: tracking a snapshot must never keep its Session alive.
+    private final Map<Session, Map<String, String>> sessionGenerations = Collections.synchronizedMap(new WeakHashMap<>());
+    private String bindingKey(String key) {
+        return Connections.flag(config.properties, "cacheKeyCaseSensitivity", false) ? key : key.toLowerCase(Locale.ROOT);
+    }
+    private String observedGeneration(String key, Object value) {
+        if (!(value instanceof Session session)) { return null; }
+        Map<String, String> observed = sessionGenerations.get(session);
+        return observed == null ? null : observed.get(bindingKey(key));
+    }
+    private Object rememberGeneration(String key, Object value, String generation) {
+        if (value instanceof Session session) {
+            sessionGenerations.computeIfAbsent(session, ignored -> new ConcurrentHashMap<>()).put(bindingKey(key), generation);
+        }
+        return value;
+    }
     private static final Key WRITEBACK = Key.of("communityRedisSessionWriteback");
 
     /** Serialized session scopes need one writeback after the native request completes. */
-    private Object withSessionWriteback(Object value) {
+    private Object withSessionWriteback(String key, Object value, String generation) {
+        rememberGeneration(key, value, generation);
         var current = RequestBoxContext.getCurrent();
         if (!(value instanceof Session) || current == null) { return value; }
         var requestContext = current.getRequestContext();
@@ -67,14 +91,14 @@ public final class SessionRedis extends AbstractCacheProvider {
     @Override public IStruct lookup(String... keys) { return store.lookup(keys(keys)); }
     @Override public IStruct lookup(ICacheKeyFilter filter) { return store.lookup(filter); }
     @Override public Attempt<Object> get(String key) {
-        ICacheEntry entry = store.get(Key.of(key));
-        if (entry == null) { stats.recordMiss(); return Attempt.empty(); }
+        RedisStore.VersionedEntry observed = store.readVersioned(Key.of(key), true);
+        if (observed == null) { stats.recordMiss(); return Attempt.empty(); }
         stats.recordHit();
-        return entry.value().map(this::withSessionWriteback);
+        return observed.entry().value().map(value -> withSessionWriteback(key, value, observed.generation()));
     }
     @Override public Attempt<Object> getQuiet(String key) {
-        ICacheEntry entry = store.getQuiet(Key.of(key));
-        return entry == null ? Attempt.empty() : entry.value();
+        RedisStore.VersionedEntry observed = store.readVersioned(Key.of(key), false);
+        return observed == null ? Attempt.empty() : observed.entry().value().map(value -> rememberGeneration(key, value, observed.generation()));
     }
     @Override public IStruct get(String... keys) {
         IStruct result = new Struct();
@@ -82,7 +106,13 @@ public final class SessionRedis extends AbstractCacheProvider {
         return result;
     }
     @Override public IStruct get(ICacheKeyFilter filter) { return get(getKeysStream(filter).toArray(String[]::new)); }
-    @Override public void setQuiet(Key key, ICacheEntry entry) { store.set(key, entry); }
+    @Override public void setQuiet(Key key, ICacheEntry entry) { writeEntry(key.getName(), entry, false); }
+    private String writeEntry(String key, ICacheEntry entry, boolean onlyAbsent) {
+        Object value = entry.value().orElse(null);
+        String generation = store.writeVersioned(Key.of(key), entry, onlyAbsent, observedGeneration(key, value));
+        if (generation != null) { rememberGeneration(key, value, generation); }
+        return generation;
+    }
 
     private ICacheEntry entry(String key, Object value, Object timeout, Object idle, IStruct metadata) {
         long seconds = duration(timeout, "defaultTimeout", 3600);
@@ -96,7 +126,7 @@ public final class SessionRedis extends AbstractCacheProvider {
         return duration.isZero() ? 0 : Math.max(1, duration.getSeconds());
     }
     @Override public void set(String key, Object value, Object timeout, Object idle, IStruct metadata) {
-        store.set(Key.of(key), entry(key, value, timeout, idle, metadata));
+        writeEntry(key, entry(key, value, timeout, idle, metadata), false);
     }
     @Override public void set(String key, Object value, Object timeout, Object idle) { set(key, value, timeout, idle, new Struct()); }
     @Override public void set(String key, Object value, Object timeout) { set(key, value, timeout, null); }
@@ -109,7 +139,8 @@ public final class SessionRedis extends AbstractCacheProvider {
         Attempt<Object> existing = get(key);
         if (existing.isPresent()) { return existing.get(); }
         Object value = producer.get();
-        if (store.write(Key.of(key), entry(key, value, timeout, idle, metadata), true)) { return withSessionWriteback(value); }
+        String generation = writeEntry(key, entry(key, value, timeout, idle, metadata), true);
+        if (generation != null) { return withSessionWriteback(key, value, generation); }
         // Another writer won. Never overwrite its value with our stale result.
         return get(key).orElse(value);
     }
