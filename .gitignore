@@ -1,0 +1,4 @@
+target/
+libs/*.jar
+.DS_Store
+.env

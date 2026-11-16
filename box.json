@@ -1,0 +1,24 @@
+{
+  "name": "Redis and Valkey sessions for BoxLang",
+  "slug": "bx-redis-sessions",
+  "version": "0.1.0",
+  "author": "Eric Peterson",
+  "type": "boxlang-modules",
+  "shortDescription": "Native BoxLang cache and session storage using Redis or Valkey",
+  "boxlang": {
+    "minimumVersion": "1.19.0",
+    "moduleName": "redisSessions"
+  },
+  "ignore": [
+    "target/**",
+    "src/**",
+    "pom.xml",
+    "tests/**",
+    "scripts/**"
+  ],
+  "repository": {
+    "type": "git",
+    "URL": "https://github.com/elpete/bx-redis-sessions"
+  },
+  "homepage": "https://github.com/elpete/bx-redis-sessions"
+}

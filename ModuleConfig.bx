@@ -1,0 +1,10 @@
+class {
+	this.version = "0.1.0";
+	this.mapping = "redisSessions";
+	this.author = "Eric Peterson";
+	this.description = "Redis and Valkey storage for native BoxLang sessions";
+
+	function configure() {
+		settings = {};
+	}
+}
