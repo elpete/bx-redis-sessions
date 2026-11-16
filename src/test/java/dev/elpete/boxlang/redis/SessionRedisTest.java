@@ -108,6 +108,91 @@ class SessionRedisTest {
         request.shutdown();
         assertEquals("later-write", ((Session)second.get(key).get()).getSessionScope().get("userId"));
     }
+    @Test void staleSessionSnapshotCannotRecreateAClearedSession() {
+        Session original = seededSession();
+        String key = original.getCacheKey();
+        first.set(key, original, Duration.ofMinutes(5));
+        Session stale = (Session)second.get(key).get();
+        first.clear(key);
+        second.set(key, stale, Duration.ofMinutes(5));
+        assertTrue(first.get(key).isEmpty(), "A stale snapshot resurrected the cleared session");
+    }
+    @Test void staleSessionSnapshotCannotOverwriteAReplacementGeneration() {
+        Session original = seededSession();
+        String key = original.getCacheKey();
+        first.set(key, original, Duration.ofMinutes(5));
+        Session stale = (Session)second.get(key).get();
+        first.clear(key);
+        Session replacement = new Session(original.getID(), new Application(Key.of("generation-session-test")), Duration.ofMinutes(5));
+        first.set(key, replacement, Duration.ofMinutes(5));
+        second.set(key, stale, Duration.ofMinutes(5));
+        Session retained = (Session)first.get(key).get();
+        assertFalse(retained.getSessionScope().containsKey("userId"), "A stale snapshot overwrote the anonymous replacement");
+    }
+    @Test void expiredSessionSnapshotCannotExtendItsLifetime() throws Exception {
+        Session original = seededSession();
+        String key = original.getCacheKey();
+        first.set(key, original, Duration.ofSeconds(1));
+        Session stale = (Session)second.get(key).get();
+        Thread.sleep(1150);
+        second.set(key, stale, Duration.ofMinutes(5));
+        assertTrue(first.get(key).isEmpty(), "An expired snapshot renewed its own authentication");
+    }
+    @Test void legacyEntryGetsOneSharedGenerationBeforeAnyWriteback() {
+        Session original = seededSession();
+        String key = original.getCacheKey();
+        first.set(key, original, Duration.ofMinutes(5));
+        var redisKeys = first.store.client().scan("0", new redis.clients.jedis.params.ScanParams().match(namespace + ":*").count(100)).getResult();
+        assertEquals(1, redisKeys.size());
+        first.store.client().hdel(redisKeys.iterator().next(), "generation");
+        Session one = (Session)first.getQuiet(key).get();
+        Session two = (Session)second.get(key).get();
+        one.getSessionScope().put("notice", "one");
+        first.set(key, one, Duration.ofMinutes(5));
+        two.getSessionScope().put("notice", "two");
+        second.set(key, two, Duration.ofMinutes(5));
+        assertEquals("two", ((Session)first.get(key).get()).getSessionScope().get("notice"));
+        first.clear(key);
+        first.setQuiet(Key.of(key.toUpperCase(Locale.ROOT)), new ortus.boxlang.runtime.cache.BoxCacheEntry(
+            first.getName(), 300, 300, Key.of(key), one, new Struct()));
+        assertTrue(second.get(key).isEmpty(), "Quiet writes and case aliases must retain the revocation guard");
+    }
+    @Test void updatesWithinOneSessionGenerationRemainNonexclusiveAndLastWriterWins() {
+        Session original = seededSession();
+        String key = original.getCacheKey();
+        first.set(key, original, Duration.ofMinutes(5));
+        Session one = (Session)first.get(key).get();
+        Session two = (Session)second.getQuiet(key).get();
+        one.getSessionScope().put("notice", "one");
+        first.set(key, one, Duration.ofMinutes(5));
+        two.getSessionScope().put("notice", "two");
+        second.set(key, two, Duration.ofMinutes(5));
+        assertEquals("two", ((Session)first.get(key).get()).getSessionScope().get("notice"));
+    }
+    @Test @Tag("runtime-regression") void overlappingNativeRequestShutdownCannotUndoLogout() {
+        runtime.getCacheService().registerCache(first);
+        String app = "overlapping_" + namespace;
+        Key id = Key.of(UUID.randomUUID().toString());
+        var seed = nativeRequest(app, id);
+        runtime.executeSource("session.userId='member-123';", seed);
+        String key = seed.getParentOfType(SessionBoxContext.class).getSession().getCacheKey();
+        seed.shutdown();
+        var admitted = nativeRequest(app, id);
+        assertEquals("member-123", admitted.getScope(SessionScope.name).get("userId"));
+        var logout = nativeRequest(app, id);
+        logout.resetSession();
+        logout.shutdown();
+        assertTrue(second.get(key).isEmpty());
+        admitted.shutdown();
+        assertTrue(second.get(key).isEmpty(), "A request admitted before logout republished the authenticated session");
+    }
+    private Session seededSession() {
+        Application application = new Application(Key.of("generation-session-test"));
+        application.start(new ScriptingRequestBoxContext(runtime.getRuntimeContext()));
+        Session session = new Session(Key.of(UUID.randomUUID().toString()), application, Duration.ofMinutes(5));
+        session.getSessionScope().put("userId", "member-123");
+        return session;
+    }
     @Test void expiresInRedisWithoutAReaper() throws Exception {
         first.set("expiring", "value", Duration.ofSeconds(1));
         assertEquals("value", second.get("expiring").get());
